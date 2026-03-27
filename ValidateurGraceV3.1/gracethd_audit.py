@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║           AUDIT GraceTHD v3.1 — Script de conformité            ║
+║           AUDIT GraceTHD v3.0.1 — Script de conformité           ║
 ║                                                                  ║
 ║  Ce script audite un GeoPackage GraceTHD et vérifie sa           ║
-║  conformité par rapport au modèle v3.1.                          ║
+║  conformité par rapport au modèle v3.0.1.                        ║
 ║                                                                  ║
 ║  Auteur : Script généré avec Claude (Anthropic)                  ║
-║  Version : 2.0 — Complète                                        ║
-║  Date : 2026-03-24                                               ║
+║  Version : 2.1 — Fiabilisation conformité CNIG                   ║
+║  Date : 2026-03-26                                               ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 PRINCIPES DE CONCEPTION :
@@ -122,7 +122,7 @@ class AuditResult:
 
 class GraceTHDModel:
     """
-    Charge et structure les règles du modèle GraceTHD v3.1
+    Charge et structure les règles du modèle GraceTHD v3.0.1
     depuis le fichier Excel de conformité officiel (An_1b).
     """
 
@@ -146,9 +146,23 @@ class GraceTHDModel:
         ]
         df_attr['table_name'] = df_attr['table_name'].astype(str).str.strip()
         df_attr['attr_name'] = df_attr['attr_name'].astype(str).str.strip()
-        # Attributs actifs v3.1 uniquement
-        self.attributs = df_attr[df_attr['test_c3c4'] == 1].copy()
-        print(f"  -> {len(self.attributs)} attributs actifs v3.1")
+
+        # --- Filtre v3.0.1 aligné sur le générateur (C1) ---
+        # Un attribut est actif s'il a au moins un conteneur O ou C
+        conteneur_actif = (
+            df_attr['c1'].isin(['O', 'C']) |
+            df_attr['c2'].isin(['O', 'C']) |
+            df_attr['c3'].isin(['O', 'C']) |
+            df_attr['c4'].isin(['O', 'C'])
+        )
+        test_actif = (df_attr['test_c3c4'] == 1) | (df_attr['test_c3c4'] == 'Modifié')
+        modifies_actifs = (
+            (df_attr['test_c3c4'] == 0) &
+            (df_attr['comparaison_v3'] == 'Modifié') &
+            conteneur_actif
+        )
+        self.attributs = df_attr[(test_actif & conteneur_actif) | modifies_actifs].copy()
+        print(f"  -> {len(self.attributs)} attributs actifs v3.0.1")
 
         # --- Valeurs de listes (MCD_Valeurs) ---
         self.valeurs = pd.read_excel(chemin_excel, sheet_name='MCD_Valeurs', header=0)
@@ -293,6 +307,16 @@ class GraceTHDModel:
 class GeoPackageReader:
     """Interface simplifiée pour lire un GeoPackage via SQLite."""
 
+    # Regex de validation des identifiants SQL (E3 — protection injection)
+    _VALID_IDENTIFIER = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+    @classmethod
+    def _check_identifier(cls, name: str) -> str:
+        """Valide qu'un nom de table/colonne est un identifiant SQL sûr (E3)."""
+        if not cls._VALID_IDENTIFIER.match(name):
+            raise ValueError(f"Identifiant SQL invalide (risque injection) : '{name}'")
+        return name
+
     def __init__(self, chemin_gpkg: str):
         if not os.path.exists(chemin_gpkg):
             raise FileNotFoundError(f"GeoPackage introuvable : {chemin_gpkg}")
@@ -303,8 +327,16 @@ class GeoPackageReader:
         except Exception:
             pass
         self._spatialite_loaded = False
-        self.spatialite_path = None  # Sera défini par run_audit si --spatialite est passé
+        self.spatialite_path = None
         print(f"[INFO] GeoPackage ouvert : {chemin_gpkg}")
+
+    # Context manager pour fermeture propre (E4)
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     def close(self):
         self.conn.close()
@@ -385,6 +417,12 @@ class GeoPackageReader:
         for lib in libs:
             try:
                 self.conn.load_extension(lib)
+                # Test de santé SpatiaLite (E6)
+                try:
+                    self.conn.execute("SELECT ST_IsValid(MakePoint(0,0,2154))").fetchone()
+                except Exception:
+                    print("[AVERTISSEMENT] SpatiaLite chargé mais ST_IsValid non fonctionnel.")
+                    return False
                 self._spatialite_loaded = True
                 return True
             except Exception:
@@ -406,7 +444,7 @@ def test_presence_tables(model: GraceTHDModel, reader: GeoPackageReader, contene
         if table.lower() not in tables_gpkg_lower:
             issues.append(Issue(cat, "ERREUR", table, None,
                 f"Table obligatoire absente pour {conteneur}",
-                f"La table '{table}' est marquee 'O' dans le modele GraceTHD v3.1."))
+                f"La table '{table}' est marquee 'O' dans le modele GraceTHD v3.0.1."))
 
     for table in model.get_tables_conditionnelles_for_conteneur(conteneur):
         if table.lower() not in tables_gpkg_lower:
@@ -800,11 +838,10 @@ def test_inclusion_spatiale(model: GraceTHDModel, reader: GeoPackageReader, cont
         return issues
 
     # Règles d'inclusion entre zones
+    # Note : t_zpbo a été retirée du standard v3.0.1 (C2)
     regles = [
         ('t_zsro', 'zs_zn_code', 't_znro', 'zn_code', 'zs_code',
          "Zone SRO doit etre contenue dans sa zone NRO"),
-        ('t_zpbo', 'zp_zs_code', 't_zsro', 'zs_code', 'zp_code',
-         "Zone PBO doit etre contenue dans sa zone SRO"),
     ]
 
     for tbl_e, fk_col, tbl_p, pk_col, pk_enfant, desc in regles:
@@ -872,10 +909,10 @@ def test_chevauchement_zones(model: GraceTHDModel, reader: GeoPackageReader, con
             "SpatiaLite non disponible - test de chevauchement ignore."))
         return issues
 
+    # Note : t_zpbo retirée du standard v3.0.1 (C2)
     tables_zones = [
         ('t_znro', 'zn_code', "Zones NRO"),
         ('t_zsro', 'zs_code', "Zones SRO"),
-        ('t_zpbo', 'zp_code', "Zones PBO"),
     ]
 
     for tbl, pk_col, label in tables_zones:
@@ -1220,6 +1257,41 @@ def generer_rapport_pdf(result: AuditResult, chemin_pdf: str, model: GraceTHDMod
 
 # =============================================================================
 # 6. ORCHESTRATION
+def test_unicite_cab_chem(model: GraceTHDModel, reader: GeoPackageReader, conteneur: str) -> List[Issue]:
+    """
+    TEST 12 (C4) : Unicité du couple (cc_cb_code, cc_cm_code) dans t_cab_chem.
+    t_cab_chem est une table de jointure N-N sans PK explicite.
+    Un doublon sur la combinaison câble+cheminement est une erreur métier.
+    """
+    issues = []
+    cat = "12. Unicite t_cab_chem"
+
+    if not reader.has_table('t_cab_chem'):
+        return issues
+
+    cols = {c.lower() for c in reader.get_column_names('t_cab_chem')}
+    if not ('cc_cb_code' in cols and 'cc_cm_code' in cols):
+        return issues
+
+    try:
+        doublons = reader.execute_query(
+            'SELECT cc_cb_code, cc_cm_code, COUNT(*) AS nb '
+            'FROM t_cab_chem '
+            'WHERE cc_cb_code IS NOT NULL AND cc_cm_code IS NOT NULL '
+            'GROUP BY cc_cb_code, cc_cm_code HAVING nb > 1 '
+            'ORDER BY nb DESC LIMIT 5')
+        if doublons:
+            total = sum(r[2] for r in doublons)
+            ex = ", ".join(f"({r[0]},{r[1]}) x{r[2]}" for r in doublons[:3])
+            issues.append(Issue(cat, "ERREUR", "t_cab_chem", "cc_cb_code, cc_cm_code",
+                f"{total} doublon(s) sur le couple cable/cheminement",
+                f"Exemples : {ex}"))
+    except Exception as e:
+        issues.append(Issue(cat, "AVERTISSEMENT", "t_cab_chem", None,
+            f"Erreur verification unicite cab_chem : {e}"))
+    return issues
+
+
 # =============================================================================
 
 ALL_TESTS = [
@@ -1234,6 +1306,7 @@ ALL_TESTS = [
     ("9. Topologie noeuds/lignes",     test_topologie_noeuds_lignes),
     ("10. Inclusion spatiale",         test_inclusion_spatiale),
     ("11. Chevauchement des zones",    test_chevauchement_zones),
+    ("12. Unicite t_cab_chem",         test_unicite_cab_chem),  # C4
 ]
 
 
@@ -1241,8 +1314,10 @@ def run_audit(chemin_gpkg: str, chemin_excel: str, conteneur: str, spatialite_pa
     """Exécute tous les tests et retourne le résultat, le modèle et le reader."""
     model = GraceTHDModel(chemin_excel)
     reader = GeoPackageReader(chemin_gpkg)
-    reader.spatialite_path = spatialite_path  # Pour les appels load_spatialite()
+    reader.spatialite_path = spatialite_path
     result = AuditResult(fichier_gpkg=chemin_gpkg, conteneur=conteneur)
+
+    nb_ignores = 0  # E9 : compteur de tests ignorés (SpatiaLite absent)
 
     for nom_test, fn_test in ALL_TESTS:
         print(f"  -> {nom_test}...")
@@ -1251,6 +1326,9 @@ def run_audit(chemin_gpkg: str, chemin_excel: str, conteneur: str, spatialite_pa
             result.issues.extend(issues)
             ne = sum(1 for i in issues if i.severite == "ERREUR")
             nw = sum(1 for i in issues if i.severite == "AVERTISSEMENT")
+            # E9 : détecter les tests ignorés faute de SpatiaLite
+            if any("SpatiaLite" in i.message and i.severite == "INFO" for i in issues):
+                nb_ignores += 1
             status = "OK" if ne == 0 else "KO"
             print(f"    [{status}]  {ne} erreur(s), {nw} avertissement(s)")
         except Exception as e:
@@ -1258,12 +1336,15 @@ def run_audit(chemin_gpkg: str, chemin_excel: str, conteneur: str, spatialite_pa
                 f"Erreur critique lors du test : {e}"))
             print(f"    [!!] Erreur critique : {e}")
 
+    if nb_ignores > 0:
+        print(f"\n  ⚠ {nb_ignores} test(s) ignores (SpatiaLite absent)")
+
     return result, model, reader
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Audit de conformite GraceTHD v3.1 d'un GeoPackage",
+        description="Audit de conformite GraceTHD v3.0.1 d'un GeoPackage",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples :
@@ -1283,7 +1364,10 @@ Exemples :
     args = parser.parse_args()
 
     if args.excel is None:
+        # C3 : Recherche avec nom contenant des espaces (conforme au fichier CNIG)
         for path in [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "An 1b - grilles de remplissage.xlsx"),
+            os.path.join(os.path.dirname(args.gpkg) or ".", "An 1b - grilles de remplissage.xlsx"),
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "An_1b_-_grilles_de_remplissage.xlsx"),
             os.path.join(os.path.dirname(args.gpkg) or ".", "An_1b_-_grilles_de_remplissage.xlsx"),
         ]:
@@ -1303,7 +1387,7 @@ Exemples :
         )
 
     print("=" * 65)
-    print("  AUDIT GraceTHD v3.1 - 11 categories de tests")
+    print("  AUDIT GraceTHD v3.0.1 - 12 categories de tests")
     print("=" * 65)
     print(f"  Fichier    : {args.gpkg}")
     print(f"  Conteneur  : {args.conteneur}")
@@ -1313,9 +1397,14 @@ Exemples :
         print(f"  SpatiaLite : {args.spatialite}")
     print("=" * 65)
 
-    result, model, reader = run_audit(args.gpkg, args.excel, args.conteneur, args.spatialite)
-    generer_rapport_pdf(result, args.output, model, reader)
-    reader.close()
+    # E4 : fermeture garantie du reader même en cas d'erreur
+    reader = None
+    try:
+        result, model, reader = run_audit(args.gpkg, args.excel, args.conteneur, args.spatialite)
+        generer_rapport_pdf(result, args.output, model, reader)
+    finally:
+        if reader is not None:
+            reader.close()
 
     print("\n" + "=" * 65)
     print("  RESULTAT")
