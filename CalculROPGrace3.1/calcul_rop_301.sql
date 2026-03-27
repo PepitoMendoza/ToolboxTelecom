@@ -1,11 +1,11 @@
 -- ============================================================================
--- Routes optiques GraceTHD v3.1 — Calcul et stockage
+-- Routes optiques GraceTHD v3.0.1 — Calcul et stockage
 -- ============================================================================
 --
 -- Contenu de ce fichier :
---   1. Table de résultats  : gracethd3_1_raw.t_route_optique
+--   1. Table de résultats  : gracethd_v301_raw.t_route_optique
 --   2. Index sur la table  : pour les requêtes courantes
---   3. Fonction            : gracethd3_1_raw.calculer_routes_optiques()
+--   3. Fonction            : gracethd_v301_raw.calculer_routes_optiques()
 --
 -- Principe du calcul (repris du script Python GRACE v2/v3) :
 --   - On part de chaque position attachée à un tiroir (ps_ti_code IS NOT NULL)
@@ -14,13 +14,13 @@
 --   - Chaque saut est stocké en une ligne avec son rang (iteration)
 --   - La boucle s'arrête quand ps_2 est NULL ou qu'on atteint p_max_iterations
 --
--- Schéma ciblé : gracethd3_1_raw
+-- Schéma ciblé : gracethd_v301_raw
 -- Prérequis    : extension pgcrypto (pour gen_random_uuid())
 --
 -- Usage :
---   SELECT gracethd3_1_raw.calculer_routes_optiques();
---   SELECT gracethd3_1_raw.calculer_routes_optiques(p_max_iterations => 20);
---   SELECT gracethd3_1_raw.calculer_routes_optiques(p_truncate => FALSE);
+--   SELECT gracethd_v301_raw.calculer_routes_optiques();
+--   SELECT gracethd_v301_raw.calculer_routes_optiques(p_max_iterations => 20);
+--   SELECT gracethd_v301_raw.calculer_routes_optiques(p_truncate => FALSE);
 -- ============================================================================
 
 
@@ -32,10 +32,10 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- 1. TABLE DE RÉSULTATS
 -- ============================================================================
 
--- Suppression si elle existe déjà (pour re-déploiement propre)
-DROP TABLE IF EXISTS gracethd3_1_raw.t_route_optique;
-
-CREATE TABLE gracethd3_1_raw.t_route_optique (
+-- E10 : CREATE TABLE IF NOT EXISTS (idempotent, ne détruit pas les index
+-- ou colonnes ajoutés manuellement). Utiliser DROP TABLE avant si un
+-- redéploiement complet est souhaité.
+CREATE TABLE IF NOT EXISTS gracethd_v301_raw.t_route_optique (
 
     -- Clé technique auto-incrémentée
     ro_id        BIGSERIAL PRIMARY KEY,
@@ -81,20 +81,20 @@ CREATE TABLE gracethd3_1_raw.t_route_optique (
 
 );
 
-COMMENT ON TABLE gracethd3_1_raw.t_route_optique IS
+COMMENT ON TABLE gracethd_v301_raw.t_route_optique IS
     'Routes optiques calculées : une ligne par saut de position. '
     'Regrouper par route_id pour reconstituer une route complète. '
     'Généré par la fonction calculer_routes_optiques().';
 
-COMMENT ON COLUMN gracethd3_1_raw.t_route_optique.route_id IS
+COMMENT ON COLUMN gracethd_v301_raw.t_route_optique.route_id IS
     'UUID partagé par tous les sauts d''une même route (fibre suivie depuis son tiroir).';
-COMMENT ON COLUMN gracethd3_1_raw.t_route_optique.iteration IS
+COMMENT ON COLUMN gracethd_v301_raw.t_route_optique.iteration IS
     'Rang du saut : 0 = position au tiroir de départ, 1 = premier saut, etc.';
-COMMENT ON COLUMN gracethd3_1_raw.t_route_optique.segment IS
+COMMENT ON COLUMN gracethd_v301_raw.t_route_optique.segment IS
     'Type logique de câble (cb_typelog) : DI = distribution, TR = transport.';
-COMMENT ON COLUMN gracethd3_1_raw.t_route_optique.ps_1 IS
+COMMENT ON COLUMN gracethd_v301_raw.t_route_optique.ps_1 IS
     'Code de la fibre entrante dans cette position (NULL pour le saut 0).';
-COMMENT ON COLUMN gracethd3_1_raw.t_route_optique.ps_2 IS
+COMMENT ON COLUMN gracethd_v301_raw.t_route_optique.ps_2 IS
     'Code de la fibre sortante. NULL indique la fin de la route.';
 
 
@@ -103,27 +103,27 @@ COMMENT ON COLUMN gracethd3_1_raw.t_route_optique.ps_2 IS
 -- ============================================================================
 
 -- Index principal : reconstituer une route par son UUID
-CREATE INDEX idx_ro_route_id
-    ON gracethd3_1_raw.t_route_optique (route_id);
+CREATE INDEX IF NOT EXISTS idx_ro_route_id
+    ON gracethd_v301_raw.t_route_optique (route_id);
 
 -- Index pour filtrer par SRO de départ (usage fréquent)
-CREATE INDEX idx_ro_sro_code
-    ON gracethd3_1_raw.t_route_optique (sro_code);
+CREATE INDEX IF NOT EXISTS idx_ro_sro_code
+    ON gracethd_v301_raw.t_route_optique (sro_code);
 
 -- Index pour filtrer par segment (DI / TR)
-CREATE INDEX idx_ro_segment
-    ON gracethd3_1_raw.t_route_optique (segment);
+CREATE INDEX IF NOT EXISTS idx_ro_segment
+    ON gracethd_v301_raw.t_route_optique (segment);
 
 -- Index pour retrouver un saut par son code position
-CREATE INDEX idx_ro_ps_code
-    ON gracethd3_1_raw.t_route_optique (ps_code);
+CREATE INDEX IF NOT EXISTS idx_ro_ps_code
+    ON gracethd_v301_raw.t_route_optique (ps_code);
 
 
 -- ============================================================================
 -- 3. FONCTION DE CALCUL
 -- ============================================================================
 
-CREATE OR REPLACE FUNCTION gracethd3_1_raw.calculer_routes_optiques(
+CREATE OR REPLACE FUNCTION gracethd_v301_raw.calculer_routes_optiques(
     p_max_iterations INTEGER DEFAULT 15,
     -- Nombre maximal de sauts par route. Protège contre les cycles éventuels
     -- et les données corrompues. Valeur recommandée : 15 (réseau standard).
@@ -156,12 +156,18 @@ DECLARE
     -- Enregistrement de départ (positions attachées à un tiroir)
     r_depart      RECORD;
 
+    -- D2 : tableau des ps_code déjà visités pour détecter les cycles
+    v_visited     TEXT[];
+
+    -- D1 : compteur de positions candidates pour détecter les ambiguïtés
+    v_nb_candidats INTEGER;
+
 BEGIN
     -- ------------------------------------------------------------------
     -- Optionnellement, vider la table de résultats avant le calcul
     -- ------------------------------------------------------------------
     IF p_truncate THEN
-        TRUNCATE gracethd3_1_raw.t_route_optique;
+        TRUNCATE gracethd_v301_raw.t_route_optique;
         RAISE NOTICE 'Table t_route_optique vidée avant recalcul.';
     END IF;
 
@@ -175,8 +181,10 @@ BEGIN
     FOR r_depart IN
         SELECT
             -- Informations sur le local technique (SRO/NRO) de départ
+            -- D3 : lc_etiquet n'existe plus en v3.0.1, on utilise
+            -- le nom du site (st_nom) via la jointure t_local → t_site
             lc.lc_code      AS sro_code,
-            lc.lc_etiquet   AS sro_etiquet,
+            st.st_nom       AS sro_etiquet,
 
             -- Tiroir de départ
             ti.ti_code      AS ti_code,
@@ -200,26 +208,29 @@ BEGIN
             fo.fo_numtub    AS fo_numtub,
             fo.fo_nintub    AS fo_nintub
 
-        FROM gracethd3_1_raw.t_position ps
+        FROM gracethd_v301_raw.t_position ps
 
         -- Jointure obligatoire : on ne garde que les positions avec tiroir
-        JOIN gracethd3_1_raw.t_tiroir ti
+        JOIN gracethd_v301_raw.t_tiroir ti
             ON ti.ti_code = ps.ps_ti_code
 
         -- Remontée vers le local technique via baie
-        LEFT JOIN gracethd3_1_raw.t_baie ba
+        LEFT JOIN gracethd_v301_raw.t_baie ba
             ON ba.ba_code = ti.ti_ba_code
-        LEFT JOIN gracethd3_1_raw.t_local lc
+        LEFT JOIN gracethd_v301_raw.t_local lc
             ON lc.lc_code = ba.ba_lc_code
+        -- D3 : jointure vers t_site pour récupérer st_nom
+        LEFT JOIN gracethd_v301_raw.t_site st
+            ON st.st_code = lc.lc_st_code
 
         -- Cassette optionnelle (présente sur certains tiroirs, ex : CG57)
-        LEFT JOIN gracethd3_1_raw.t_cassette cs
+        LEFT JOIN gracethd_v301_raw.t_cassette cs
             ON cs.cs_code = ps.ps_cs_code
 
         -- Fibre et câble associés à la sortie ps_2
-        LEFT JOIN gracethd3_1_raw.t_fibre fo
+        LEFT JOIN gracethd_v301_raw.t_fibre fo
             ON fo.fo_code = ps.ps_2
-        LEFT JOIN gracethd3_1_raw.t_cable cb
+        LEFT JOIN gracethd_v301_raw.t_cable cb
             ON cb.cb_code = fo.fo_cb_code
 
         -- Tri identique au script Python : tiroir, cassette, numéro de position
@@ -234,7 +245,7 @@ BEGIN
         -- ---------------------------------------------------------------
         -- Insertion du saut 0 : la position de départ au niveau du tiroir
         -- ---------------------------------------------------------------
-        INSERT INTO gracethd3_1_raw.t_route_optique (
+        INSERT INTO gracethd_v301_raw.t_route_optique (
             route_id,
             sro_code, sro_etiquet,
             tiroir_code,
@@ -258,17 +269,35 @@ BEGIN
 
         v_nb_routes := v_nb_routes + 1;
         v_iteration := 1;
+        -- D2 : initialiser le tableau des positions visitées
+        v_visited := ARRAY[r_depart.ps_code];
 
         -- ---------------------------------------------------------------
         -- Boucle de suivi : on remonte la chaîne ps_1 → ps_2
         --
-        -- Condition d'arrêt :
+        -- Conditions d'arrêt :
         --   - ps_2 de la position courante est NULL (fin de route)
-        --   - On a atteint p_max_iterations (protection anti-boucle infinie)
+        --   - On a atteint p_max_iterations (protection anti-boucle)
+        --   - Cycle détecté (D2) : une position déjà visitée est retrouvée
         -- ---------------------------------------------------------------
         WHILE v_ps2_courant IS NOT NULL AND v_iteration <= p_max_iterations LOOP
 
+            -- D1 : Vérifier s'il y a plusieurs positions candidates
+            SELECT COUNT(*)
+            INTO v_nb_candidats
+            FROM gracethd_v301_raw.t_position ps
+            WHERE ps.ps_1 = v_ps2_courant;
+
+            IF v_nb_candidats > 1 THEN
+                RAISE WARNING
+                    'Route % (tiroir %) iteration % : % positions ont ps_1 = %. '
+                    'Seule la première (par ps_code) est suivie — ambiguïté dans les données.',
+                    v_route_id, r_depart.ti_code, v_iteration,
+                    v_nb_candidats, v_ps2_courant;
+            END IF;
+
             -- Chercher la position suivante dont ps_1 = ps_2 courant
+            -- D1 : ORDER BY + LIMIT 1 pour un résultat déterministe
             SELECT
                 ps.ps_code      AS ps_code,
                 ps.ps_fonct     AS ps_fonct,
@@ -288,29 +317,42 @@ BEGIN
 
             INTO v_saut_suivant
 
-            FROM gracethd3_1_raw.t_position ps
+            FROM gracethd_v301_raw.t_position ps
 
             -- La jointure clé : ps_1 du saut suivant = ps_2 du saut courant
             -- C'est le mécanisme de chaînage de la route optique
 
-            LEFT JOIN gracethd3_1_raw.t_cassette cs
+            LEFT JOIN gracethd_v301_raw.t_cassette cs
                 ON cs.cs_code = ps.ps_cs_code
-            LEFT JOIN gracethd3_1_raw.t_ebp ebp
+            LEFT JOIN gracethd_v301_raw.t_ebp ebp
                 ON ebp.bp_code = cs.cs_bp_code
-            LEFT JOIN gracethd3_1_raw.t_tiroir ti2
+            LEFT JOIN gracethd_v301_raw.t_tiroir ti2
                 ON ti2.ti_code = ps.ps_ti_code
-            LEFT JOIN gracethd3_1_raw.t_fibre fo
+            LEFT JOIN gracethd_v301_raw.t_fibre fo
                 ON fo.fo_code = ps.ps_2
-            LEFT JOIN gracethd3_1_raw.t_cable cb
+            LEFT JOIN gracethd_v301_raw.t_cable cb
                 ON cb.cb_code = fo.fo_cb_code
 
-            WHERE ps.ps_1 = v_ps2_courant;
+            WHERE ps.ps_1 = v_ps2_courant
+            ORDER BY ps.ps_code ASC   -- D1 : tri déterministe
+            LIMIT 1;                   -- D1 : une seule position retenue
 
             -- Si aucune position suivante : fin de la route
             EXIT WHEN NOT FOUND;
 
+            -- D2 : Détection de cycle — la position a-t-elle déjà été visitée ?
+            IF v_saut_suivant.ps_code = ANY(v_visited) THEN
+                RAISE WARNING
+                    'Route % (tiroir %) : CYCLE détecté à l''iteration %. '
+                    'La position % a déjà été visitée. Route interrompue.',
+                    v_route_id, r_depart.ti_code, v_iteration,
+                    v_saut_suivant.ps_code;
+                EXIT;  -- Sortir de la boucle
+            END IF;
+            v_visited := array_append(v_visited, v_saut_suivant.ps_code);
+
             -- Insertion du saut courant
-            INSERT INTO gracethd3_1_raw.t_route_optique (
+            INSERT INTO gracethd_v301_raw.t_route_optique (
                 route_id,
                 sro_code, sro_etiquet,
                 tiroir_code,
@@ -356,11 +398,12 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION gracethd3_1_raw.calculer_routes_optiques(INTEGER, BOOLEAN) IS
+COMMENT ON FUNCTION gracethd_v301_raw.calculer_routes_optiques(INTEGER, BOOLEAN) IS
     'Calcule les routes optiques depuis les tiroirs et les stocke dans t_route_optique. '
     'Une ligne = un saut de position. Toute la chaîne d''une même fibre partage le même route_id. '
     'p_max_iterations : nombre maximal de sauts (défaut 15, protection anti-boucle). '
-    'p_truncate : si TRUE (défaut), vide la table avant le calcul.';
+    'p_truncate : si TRUE (défaut), vide la table avant le calcul. '
+    'Protections : détection de cycles (WARNING), gestion des ambiguïtés multi-résultats (WARNING).';
 
 
 -- ============================================================================
@@ -368,21 +411,21 @@ COMMENT ON FUNCTION gracethd3_1_raw.calculer_routes_optiques(INTEGER, BOOLEAN) I
 -- ============================================================================
 
 -- Recalcul complet (défaut)
--- SELECT gracethd3_1_raw.calculer_routes_optiques();
+-- SELECT gracethd_v301_raw.calculer_routes_optiques();
 
 -- Recalcul avec une limite de 20 sauts
--- SELECT gracethd3_1_raw.calculer_routes_optiques(p_max_iterations => 20);
+-- SELECT gracethd_v301_raw.calculer_routes_optiques(p_max_iterations => 20);
 
 -- Ajouter sans vider (par exemple après import partiel de données)
--- SELECT gracethd3_1_raw.calculer_routes_optiques(p_truncate => FALSE);
+-- SELECT gracethd_v301_raw.calculer_routes_optiques(p_truncate => FALSE);
 
 -- Consulter une route complète reconstituée
--- SELECT * FROM gracethd3_1_raw.t_route_optique
+-- SELECT * FROM gracethd_v301_raw.t_route_optique
 -- WHERE route_id = '<uuid>'
 -- ORDER BY iteration;
 
 -- Résumé par SRO : nombre de routes et profondeur max
 -- SELECT sro_code, COUNT(DISTINCT route_id) AS nb_routes, MAX(iteration) AS max_sauts
--- FROM gracethd3_1_raw.t_route_optique
+-- FROM gracethd_v301_raw.t_route_optique
 -- GROUP BY sro_code
 -- ORDER BY sro_code;
