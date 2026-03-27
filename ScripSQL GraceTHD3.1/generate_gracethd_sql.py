@@ -2,21 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  Générateur SQL — Schéma PostgreSQL/PostGIS GraceTHD v3.1          ║
+║  Générateur SQL — Schéma PostgreSQL/PostGIS GraceTHD v3.0.1        ║
 ║                                                                      ║
 ║  Lit la matrice de conformité (Excel An_1b) et produit un script     ║
-║  SQL complet pour créer la base de données GraceTHD v3.1.            ║
+║  SQL complet pour créer la base de données GraceTHD v3.0.1.          ║
 ║                                                                      ║
 ║  Auteur : Script généré avec Claude (Anthropic)                      ║
-║  Version : 1.0                                                       ║
-║  Date : 2026-03-24                                                   ║
+║  Version : 2.0 — Fiabilisation conformité CNIG                      ║
+║  Date : 2026-03-26                                                   ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
 UTILISATION :
-    python generate_gracethd_sql.py An_1b_-_grilles_de_remplissage.xlsx
+    python generate_gracethd_sql.py "An 1b - grilles de remplissage.xlsx"
 
 SORTIE :
-    Fichier SQL : gracethd_v31_schema.sql
+    Fichier SQL : gracethd_v301_schema.sql
 
 CE QUE LE SCRIPT GÉNÈRE :
     1. Création du schéma + activation PostGIS
@@ -33,6 +33,9 @@ PRINCIPES :
     - Les FK sont ajoutées en fin de script (après toutes les tables)
     - Les index sont créés après les FK
     - Tout est documenté avec COMMENT ON
+
+DÉPENDANCES :
+    pip install pandas openpyxl
 """
 
 import sys
@@ -47,11 +50,23 @@ import pandas as pd
 # CONFIGURATION
 # =============================================================================
 
-SCHEMA = "gracethd3_1_raw"
+SCHEMA = "gracethd_v301_raw"
 SRID = 2154  # Lambert 93
+
+# Dictionnaire centralisé de corrections de typos dans la matrice Excel (D4)
+TYPO_CORRECTIONS = {
+    'l_geoloc_class': 'l_geoloc_classe',
+}
+
+# Corrections de données connues dans MCD_Valeurs (D7)
+# Format : (table_liste, code, champ_corrigé, valeur_corrigée)
+DATA_CORRECTIONS = [
+    ('l_bp_type_phy', 'B336', 'libelle', 'BPE 336FO'),  # D7: typo 366 → 336
+]
 
 # Ordre de création des tables (résout les dépendances de FK)
 # Les tables référencées par d'autres doivent être créées en premier.
+# Note : t_zpbo a été retiré car supprimée du standard v3.0.1 (B2)
 TABLE_CREATION_ORDER = [
     # 1. Tables sans dépendance vers d'autres tables métier
     "t_organisme",
@@ -77,7 +92,6 @@ TABLE_CREATION_ORDER = [
     # 4. Tables de zonage
     "t_znro",
     "t_zsro",
-    "t_zpbo",
     "t_zdep",
     # 5. Tables finales (dépendent de beaucoup d'autres)
     "t_adresse",
@@ -177,9 +191,23 @@ def load_excel(path: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Charge les 3 onglets de la matrice de conformité.
 
-    Retourne : (df_classes, df_attributs_v31, df_valeurs)
+    Retourne : (df_classes, df_attributs_v301, df_valeurs)
+
+    Filtre v3.0.1 : on ne garde que les attributs qui ont au moins un
+    conteneur O ou C. Cela exclut automatiquement :
+      - Les attributs « Supprimé » avec tous conteneurs à N (B1/B3)
+      - Les tables supprimées comme t_zpbo (B2)
+    On inclut aussi les attributs « Modifié » avec test=0 ET au moins
+    un conteneur actif (ex : t_zdep, *_perirec).
+    On inclut les attributs avec test_c3c4 = 'Modifié' (chaîne, ex : ps_preaff) (B4).
     """
     print(f"[INFO] Chargement de la matrice : {path}")
+
+    # Vérifier que les onglets attendus existent (E2)
+    xls = pd.ExcelFile(path)
+    for sheet in ['MCD_Classes', 'MCD_Attributs', 'MCD_Valeurs']:
+        assert sheet in xls.sheet_names, \
+            f"Onglet '{sheet}' absent du fichier Excel. Onglets trouvés : {xls.sheet_names}"
 
     # --- MCD_Classes (tables) ---
     df_classes = pd.read_excel(path, sheet_name='MCD_Classes', header=0)
@@ -187,10 +215,16 @@ def load_excel(path: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         c.replace('\xa0', ' ').replace('\n', ' ').strip()
         for c in df_classes.columns
     ]
+    assert len(df_classes) > 0, "L'onglet MCD_Classes est vide."
     print(f"  → {len(df_classes)} tables chargées")
 
     # --- MCD_Attributs ---
     df_attr = pd.read_excel(path, sheet_name='MCD_Attributs', header=0)
+
+    # Vérification de la structure (E1) : on s'assure qu'il y a assez de colonnes
+    assert len(df_attr.columns) >= 18, \
+        f"MCD_Attributs : {len(df_attr.columns)} colonnes (attendu >= 18)"
+
     df_attr.columns = [
         'table_name', 'attr_name', 'attr_v2', 'type_sql', 'type_gpkg',
         'contraintes', 'relation', 'definition',
@@ -201,18 +235,36 @@ def load_excel(path: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df_attr['table_name'] = df_attr['table_name'].astype(str).str.strip()
     df_attr['attr_name'] = df_attr['attr_name'].astype(str).str.strip()
 
-    # Filtre v3.1 : attributs actifs (test=1) + attributs modifiés non testés (t_zdep, etc.)
-    v31 = df_attr[
-        (df_attr['test_c3c4'] == 1) |
-        ((df_attr['test_c3c4'] == 0) & (df_attr['comparaison_v3'] == 'Modifié'))
-    ].copy()
-    print(f"  → {len(v31)} attributs actifs v3.1")
+    # --- Filtre v3.0.1 (B1/B3/B4) ---
+    # Un attribut est actif s'il a au moins un conteneur O ou C
+    conteneur_actif = (
+        df_attr['c1'].isin(['O', 'C']) |
+        df_attr['c2'].isin(['O', 'C']) |
+        df_attr['c3'].isin(['O', 'C']) |
+        df_attr['c4'].isin(['O', 'C'])
+    )
+
+    # Filtre principal : test_c3c4 == 1 (ou chaîne 'Modifié' pour ps_preaff)
+    # ET au moins un conteneur actif
+    test_actif = (df_attr['test_c3c4'] == 1) | (df_attr['test_c3c4'] == 'Modifié')
+
+    # Cas spécial : attributs Modifiés avec test=0 mais conteneur actif
+    modifies_actifs = (
+        (df_attr['test_c3c4'] == 0) &
+        (df_attr['comparaison_v3'] == 'Modifié') &
+        conteneur_actif
+    )
+
+    v301 = df_attr[(test_actif & conteneur_actif) | modifies_actifs].copy()
+
+    print(f"  → {len(v301)} attributs actifs v3.0.1 (après exclusion des Supprimés hors conteneur)")
 
     # --- MCD_Valeurs ---
     df_val = pd.read_excel(path, sheet_name='MCD_Valeurs', header=0)
+    assert len(df_val) > 0, "L'onglet MCD_Valeurs est vide."
     print(f"  → {len(df_val)} valeurs de listes")
 
-    return df_classes, v31, df_val
+    return df_classes, v301, df_val
 
 
 # =============================================================================
@@ -223,15 +275,15 @@ def generate_header(schema: str) -> str:
     """En-tête du script SQL avec création du schéma et activation PostGIS."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     return f"""-- ============================================================================
--- Script de création du schéma PostgreSQL/PostGIS GraceTHD v3.1
+-- Script de création du schéma PostgreSQL/PostGIS GraceTHD v3.0.1
 -- ============================================================================
 --
 -- Schéma    : {schema}
 -- SRID      : {SRID} (Lambert 93)
 -- Généré le : {now}
--- Source    : Matrice de conformité An_1b — Grilles de remplissage v3.1
+-- Source    : Matrice de conformité An_1b — Grilles de remplissage v3.0.1
 --
--- Ce script crée la structure complète du modèle GraceTHD v3.1 :
+-- Ce script crée la structure complète du modèle GraceTHD v3.0.1 :
 --   1. Schéma et extension PostGIS
 --   2. Tables de listes de valeurs (domaines l_*)
 --   3. Tables métier (t_*)
@@ -255,8 +307,8 @@ CREATE SCHEMA IF NOT EXISTS {schema};
 -- PostGIS pour les types géométriques et les fonctions spatiales
 CREATE EXTENSION IF NOT EXISTS postgis;
 
--- Permettre l'utilisation du schéma par défaut dans les requêtes
-SET search_path TO {schema}, public;
+-- Limiter le search_path à la transaction courante (D5)
+SET LOCAL search_path TO {schema}, public;
 
 """
 
@@ -291,7 +343,7 @@ def generate_lookup_tables(df_val: pd.DataFrame, df_attrs: pd.DataFrame,
 
         # Déterminer la longueur max du code pour dimensionner le VARCHAR
         max_code_len = max(rows[col_code].astype(str).str.len().max(), 3)
-        code_size = max(max_code_len + 2, 5)  # Marge de sécurité
+        code_size = max(max_code_len + 5, 10)  # Marge de sécurité élargie (D6)
 
         lines.append(f"-- Liste : {liste_name}")
         lines.append(f"CREATE TABLE {schema}.{liste_name} (")
@@ -304,6 +356,12 @@ def generate_lookup_tables(df_val: pd.DataFrame, df_attrs: pd.DataFrame,
         for _, row in rows.iterrows():
             code = sql_escape(str(row[col_code]).strip())
             libelle = sql_escape(str(row[col_lib]).strip())
+
+            # Appliquer les corrections de données connues (D7)
+            for corr_table, corr_code, corr_field, corr_value in DATA_CORRECTIONS:
+                if liste_name == corr_table and code == corr_code and corr_field == 'libelle':
+                    libelle = sql_escape(corr_value)
+
             lines.append(
                 f"INSERT INTO {schema}.{liste_name} (code, libelle) "
                 f"VALUES ('{code}', '{libelle}');"
@@ -318,10 +376,11 @@ def generate_lookup_tables(df_val: pd.DataFrame, df_attrs: pd.DataFrame,
         if match:
             ref_lists.add(match.group(1))
 
-    # Normaliser l_geoloc_class → l_geoloc_classe (coquille dans la matrice)
-    if 'l_geoloc_class' in ref_lists:
-        ref_lists.discard('l_geoloc_class')
-        ref_lists.add('l_geoloc_classe')
+    # Normaliser les typos connues (D4 — dictionnaire centralisé)
+    corrected = set()
+    for name in ref_lists:
+        corrected.add(TYPO_CORRECTIONS.get(name, name))
+    ref_lists = corrected
 
     listes_manquantes = sorted(ref_lists - set(listes_avec_valeurs))
 
@@ -556,9 +615,8 @@ def generate_foreign_keys(v31: pd.DataFrame, schema: str) -> str:
         ref_table = match.group(1).strip()
         ref_col = match.group(2).strip()
 
-        # Corriger la coquille l_geoloc_class → l_geoloc_classe
-        if ref_table == 'l_geoloc_class':
-            ref_table = 'l_geoloc_classe'
+        # Corriger les typos connues via le dictionnaire centralisé (D4)
+        ref_table = TYPO_CORRECTIONS.get(ref_table, ref_table)
 
         fk_name = f"fk_{table_name}_{attr_name}"
         lines.append(
@@ -690,7 +748,7 @@ def generate_comments(v31: pd.DataFrame, df_classes: pd.DataFrame,
 
 def generate_footer() -> str:
     """Pied du script SQL : COMMIT de la transaction."""
-    return """
+    return f"""
 -- ============================================================================
 -- FIN DU SCRIPT
 -- ============================================================================
@@ -699,11 +757,11 @@ COMMIT;
 
 -- Pour vérifier l'installation :
 --   SELECT table_name FROM information_schema.tables
---   WHERE table_schema = '""" + SCHEMA + """' ORDER BY table_name;
+--   WHERE table_schema = '{SCHEMA}' ORDER BY table_name;
 --
 --   SELECT f_table_name, f_geometry_column, type, srid
 --   FROM geometry_columns
---   WHERE f_table_schema = '""" + SCHEMA + """';
+--   WHERE f_table_schema = '{SCHEMA}';
 """
 
 
@@ -720,23 +778,24 @@ def main():
     if len(sys.argv) > 1:
         excel_path = sys.argv[1]
     else:
-        excel_path = "An_1b_-_grilles_de_remplissage.xlsx"
+        # C3 : Nom avec espaces, conforme au fichier fourni par le CNIG
+        excel_path = "An 1b - grilles de remplissage.xlsx"
 
     # Chemin de sortie SQL
-    output_path = "gracethd_v31_schema.sql"
+    output_path = "gracethd_v301_schema.sql"
 
     # Charger les données
-    df_classes, v31, df_val = load_excel(excel_path)
+    df_classes, v301, df_val = load_excel(excel_path)
 
     # Générer chaque section
     print("[INFO] Génération du SQL...")
     sections = [
         generate_header(SCHEMA),
-        generate_lookup_tables(df_val, v31, SCHEMA),
-        generate_all_tables(v31, df_classes, SCHEMA),
-        generate_foreign_keys(v31, SCHEMA),
-        generate_indexes(v31, SCHEMA),
-        generate_comments(v31, df_classes, SCHEMA),
+        generate_lookup_tables(df_val, v301, SCHEMA),
+        generate_all_tables(v301, df_classes, SCHEMA),
+        generate_foreign_keys(v301, SCHEMA),
+        generate_indexes(v301, SCHEMA),
+        generate_comments(v301, df_classes, SCHEMA),
         generate_footer(),
     ]
 
@@ -746,17 +805,17 @@ def main():
         f.write(full_sql)
 
     # Statistiques
-    nb_tables_metier = len(v31['table_name'].unique())
+    nb_tables_metier = len(v301['table_name'].unique())
     nb_listes = len(df_val[df_val.columns[0]].dropna().unique())
-    nb_fk = sum(1 for _, a in v31.iterrows()
+    nb_fk = sum(1 for _, a in v301.iterrows()
                 if pd.notna(a['relation']) and str(a['relation']).strip().startswith('REFERENCES'))
-    nb_geom = sum(1 for _, a in v31.iterrows()
+    nb_geom = sum(1 for _, a in v301.iterrows()
                   if parse_geometry_type(a['type_sql']) is not None)
 
     print(f"[OK] Fichier généré : {output_path}")
     print(f"     → {nb_tables_metier} tables métier")
     print(f"     → {nb_listes} tables de listes (avec valeurs)")
-    print(f"     → {len(v31)} colonnes")
+    print(f"     → {len(v301)} colonnes")
     print(f"     → {nb_geom} colonnes géométriques (SRID {SRID})")
     print(f"     → {nb_fk} clés étrangères")
 
