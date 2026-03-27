@@ -17,3 +17,13 @@ Voici ce que contient le script SQL (~2600 lignes) :
 Le tout est encapsulé dans une transaction (BEGIN/COMMIT). Le script Python (generate_gracethd_sql.py) permet de régénérer le SQL à partir de l'Excel si la matrice évolue.
 
 Le script Python permet quant à lui de recréer le schéma SQL en se basant sur une nouvelle version de la grille de remplissage (en attendant une nouvelle version...).
+
+### Dépendances Python pour les scripts GraceTHD v3.0.1
+# Installation : pip install -r requirements.txt
+
+# Lecture des fichiers Excel (matrice de conformité An_1b)
+pandas>=1.5
+openpyxl>=3.0
+
+# Génération du rapport PDF d'audit (gracethd_audit.py)
+reportlab>=3.6
